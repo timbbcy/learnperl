@@ -1,0 +1,884 @@
+#!/usr/bin/perl
+# TanFengwei
+##20140722 tfw 新增-c(city)/-m(mode)参数, 支持免菜单批量启停操作
+
+BEGIN{push(@INC,"/usr1/monk/bin")};
+#use strict;
+use POSIX ":sys_wait_h";
+use Time::Local;
+use File::Path;
+use POSIX qw(strftime);
+use Getopt::Std;
+
+use vars qw($opt_c $opt_m $opt_h); 
+getopts('c\m:h');
+
+our (@lib_dir,%window,%key_length,%process,$city,$City,$city_num,$conf_dir,$interrupt,$host_state,$core_dir,$node0,%process_menu,$start_wait_time,$stop_wait_time);
+
+do "start_menu.cfg";
+our $function = 'start';
+my $proc_cfg = "start_process.cfg";
+my $tty_cols = ( `stty -a|grep columns 2>/dev/null` =~ /rows\; (\d+) column/ ? $1 : 130);
+my ($xxoo,$node,$script_str,$count,$length,%child_pids,%child_alive,$host_flag,$cn,@ps_args0,$env,$exist_flag,$flags);
+my @symbol = ('-','\\','|','/');
+my $s = 0;
+chomp(my $user = `whoami`);
+chomp(my $hostname = `hostname`);
+our ($h_mode) = $hostname =~ /(GD.+CBE|GD.+ABM|CBE|ABM|TPC|FEP|RBI)/;
+my %mode_hash = ('CBE'=>'01','ABM'=>'02','TPC'=>'03','FEP'=>'04','GDBOSS-CBE'=>'05','GDBOSS-ABM'=>'06','RBI'=>'07');
+my $k_str = $h_mode !~ /ABM/ ? "|awk \'\$3==1{print \$2}\'|xargs kill" : "|awk \'{print \$2}\'|xargs kill";
+my $color_bl = "\033[7m";
+my $env_tmp = ". ~$user/.profile";
+
+## 主机定义
+our %hosts = (
+   'YF1' => {'yf'=>2014},           'SG1' => {'sg'=>2012},  'SW1' => {'dw'=>2004},           'FS9' => {'zh'=>2001},
+   'YF2' => {'yf'=>2014},           'SG2' => {'sg'=>2012},  'SW2' => {'fs3'=>2004},          'FS10'=> {'zh'=>2001},
+                                     
+   'ST1' => {'st1'=>2006},           'ST3' => {'st'=>2006},   'ST5' => {'st2'=>2007},            'JY1' => {'jy'=>2010},  'ZH1'=> {'zh'=>2001},
+   'ST2' => {'st1'=>2006},           'ST4' => {'st'=>2006},   'ST6' => {'st2'=>2007},            'JY2' => {'jy'=>2010},  'ZH2'=> {'zh'=>2001},
+
+   'SZ7' => {'sz4'=>2024},           'SZ17'=> {'sz4'=>2024},   JY3' => {'jy'=>2010},
+   'SZ8' => {'sz4'=>2024},           'SZ18'=> {'sz4'=>2024},   JY4' => {'jy'=>2010},
+   );
+
+#my $mult_node = "ST5|ST6|ST11|ST12";  # 混节点
+my %swic_flag = ('gd'=>'集团','sz'=>'深圳','fs'=>'佛山','zs'=>'中山','zh'=>'珠海','st'=>'汕头','sw'=>'汕尾','jy'=>'揭阳','cz'=>'潮州','qy'=>'清远','sg'=>'韶关','yf'=>'云浮','zq'=>'肇庆');
+my %functions = ('start'=>'程序启动', 'stop'=>'程序停止', 'restart'=>'程序重启');
+my $prompt = 1;
+my $zombies = 0;    # 记录僵死进程个数
+my $log_path = "/logs/_start_logs";
+
+$SIG{CHLD} = sub { $zombies++ };   # 统计僵死进程个数      
+$SIG{TERM} = $SIG{INT} = $SIG{QUIT} = sub{$interrupt=1;};  #捕获异常退出信号
+
+#计算各子菜单项的最大长度
+sub item_length{
+  for my $key(keys %window){
+    my $mm;
+    for(sort keys %{$window{$key}}){
+      if($_ >0){
+        next if $window{$key}{$_}->[2] && $host_state ne $window{$key}{$_}->[2];
+        my $len = length($window{$key}{$_}->[0]);
+        my $mod = ++$mm % 2;
+        $key_length{$key}{$mod} = $len if $len > $key_length{$key}{$mod};
+      }
+    }
+    $key_length{$key}{$_} += 4 foreach (keys %{$key_length{$key}});
+  }
+}
+
+
+sub reaper {
+     foreach my $pid(keys %child_pids){
+         next if ! $child_pids{$pid};
+         if ((my $cc = waitpid($pid, WNOHANG)) == $pid) {
+               $zombies--;
+               $child_pids{$pid} = 0;
+         } 
+     }
+}
+
+sub deal_attr {
+    my ($nums,$command,$spl_nums) = @{$process{$_[0]}};
+    my $num = ${$nums}{'ng'};
+    my ($s_num,$com_nn,%attr_flag,$new_command,$new_command2) ;
+    foreach(sort keys %{$nums}) {
+         $num = ${$nums}{$_} if $cn =~ /$_/i;
+    }
+    if ($spl_nums) {
+         foreach(sort keys %{$spl_nums}) {
+             $s_num = ${$spl_nums}{$_} if $cn =~ /$_/i;
+         }
+         @{$command} = splice(@{$command},0,$s_num) if $s_num;
+    }
+    foreach(@{$command}){
+         $_ =~ s/^\s+|\s+$//g;
+         next if $attr_flag{$_};
+         $com_nn++ unless ( my ($new_com) = $_ =~ m/(.+)\[YY\]\s*$/ );
+         if ($new_com){
+             #$_ = $new_com;
+             push @{$new_command},$new_com;
+         }else{
+             push @{$new_command},$_;
+             push @{$new_command2},$_;
+         }
+         $attr_flag{$_} = 1;
+    }
+    return ($num,$com_nn,$new_command,$new_command2);
+}
+
+sub get_process {
+    my ($sub_key,$ps_flag) = @_;
+    my ($num,$com_nn,$new_command,$command) = &deal_attr($sub_key);
+    my @ps_res;
+    @ps_args0 = `ps -ef|egrep -v  "grep|bash|ps -e"` unless $ps_flag;
+    foreach my $acom(@$command) {
+        foreach (@ps_args0) {
+            push @ps_res,$_ if $_ =~ $acom;
+        }
+    }
+    return @ps_res;
+}
+
+
+sub all_proc_pid {
+    my ($sub_key) = @_;
+    my @pid_tmp = get_process($sub_key);
+    my @pid_attrs;
+    foreach(@pid_tmp){
+        s/^\s*//g;
+        my @line = split(/\s+/,$_);
+        push @pid_attrs,$line[1] if $line[2] ne '1';
+    }
+    return @pid_attrs;
+}
+
+sub all_proc {
+    my ($sub_key,$ps_flag,$child_flag) = @_;
+    my @pid_tmp = get_process($sub_key,$ps_flag);
+    my $pro_num = 0;
+    foreach(@pid_tmp){
+        s/^\s*//g;
+        my @line = split(/\s+/,$_);
+        if($child_flag){
+            $pro_num++ if $line[2] ne '1';
+        }else{
+            $pro_num++ if $line[2] eq '1';
+        }
+    }
+    return $pro_num;
+}
+
+sub single_proc {
+    my ($sub_key,$nn) = @_;
+    my $num_pid = 0;
+    my @pid_tmp = get_process($sub_key);
+    foreach(@pid_tmp){
+        s/^\s*|\s*$//g;
+        my @line = split(/\s+/,$_);
+        $_ =~ /\s+(\d+)$/;
+        return $line[1] if $1 eq $nn; 
+    }
+    return $num_pid;
+}
+
+sub proc_stop {
+    my ($num,$com_nn,$new_command,$command) = &deal_attr($_[0]);
+    my @ps_str;
+    foreach (@$command) {
+        push @ps_str,"p \"$_\"";
+    }
+    return @ps_str;
+}
+
+sub is_exist{
+       my ($key,$key2) = @_;
+       my ($values);
+       my @value = @{$window{$key}{$key2}};
+       if(! $value[2] || $host_state eq $value[2]){
+          if($value[1] =~ /^sub/){
+             if($window{$value[1]}){
+                  foreach my $child_key (sort keys %{$window{$value[1]}}) {
+                         next if $child_key eq '00';
+                         &is_exist($value[1],$child_key) ;
+                         last if $exist_flag == 2;
+                  }
+             }
+          }elsif($value[1] =~ /^command/){
+             $values .= "$key.$key2";
+             if( $process{$values}) {
+                  my $child_flag = 1 if $value[1] eq 'command_rebt';
+                  my $pro_num = &all_proc($values,1,$child_flag);
+                  my ($num,$com_nn,$new_command,$command) = &deal_attr($values);
+                  my $all_num = $num * $com_nn;
+                  if ( $all_num ) {
+                         if ( $pro_num < $all_num ) {
+                              $exist_flag = $exist_flag == 0 ? 3 : ($exist_flag == 1 ? 2 : 3);
+                         } else {
+                              $exist_flag = $exist_flag == 0 ? 1 : ($exist_flag == 3 ? 2 : 1);
+                         }
+                  }
+             }
+          }
+       }
+}
+
+sub proc_bar{
+        local $| = 1;
+        my ($i,$n) = @_;
+        $i = $n if $i > $n;
+        #my $sym = $i==$n ? '|' : $symbol[$s];
+        my $sym = $symbol[$s];
+        print "\033[?25l";
+        print "\r   $sym".("x" x int(($i/$n)*$length)).("\." x ($length - (int(($i/$n)*$length))))."$sym ";
+        printf("[%d/%d]%2.1f%%%5s",$i,$n,$i/$n*100," ");
+        $s = ($s>=3) ? 0 : $s+1;
+        print "\033[?25h";
+        local $| = 0;
+}
+
+sub create_child {
+       my ($s_str,$s_num,$fc,$child_flag) = @_;
+       my $pid = fork();
+       $child_pids{$pid} = 1;
+       $child_alive{$pid} = 1;
+       my $p_num ;
+       exit 1 if ! defined($pid);
+       if (! $pid) { # 显示进度条
+           while(($p_num = &all_proc($s_str,0,$child_flag)) || 1) {
+           proc_bar($p_num,$s_num);
+           last if $fc eq 'start' && $p_num >= $s_num;
+           last if $fc eq 'stop' && ! $s_num;
+           }
+           sleep 120;
+       }
+       select(undef, undef, undef, 0.5);
+       return $pid;
+}
+
+sub kill_child {
+            my $pid = $_[0];
+            if($child_alive{$pid}) {
+                 kill 9, $pid;
+                 $child_alive{$pid} = 0;
+                 if ((my $cc = waitpid($pid, WNOHANG)) == $pid) {
+               $zombies--;
+               $child_pids{$pid} = 0;
+         } 
+            }
+}
+
+sub get_str{
+   my $key = $_[0];
+   #$script_str = $window{$key}{'00'}->[0]." ∞ ".$script_str;
+   $script_str = $window{$key}{'00'}->[0]." → " .$script_str;
+   get_str($window{$key}{'00'}->[1]) if $window{$key}{'00'}->[1] ne 'main';
+}
+
+sub the_fucking_cmd {
+   my ($jj,@cc) = @_;
+   my $cmd = join("$jj;",@cc);
+   system("$env; $cmd $jj &");
+}
+
+sub start{
+   my ($num,$com_nn,$command,$new_command2) = &deal_attr($_[0]);
+   if(!$num){print "-> $color_bl进程无需启动! \033[m\n\n";return 1;}
+
+   my $all_num = $num * $com_nn;
+   my $pro_num = &all_proc($_[0]);
+   my @ps_attr = &proc_stop($_[0]);
+   my $ps_str = join("]\n   [",@ps_attr); 
+   if($pro_num > 0){print "-> $color_bl进程[$pro_num个]已经启动.请不要重复启动! 请检查\033[m\n   [$ps_str]\n\n";return 1;}
+   if($num !~ /\d+/){print "-> $color_bl进程数非法,请检查$proc_cfg配置\033[m\n\n";return 1;}
+   my $commands = join("] \n       [",@$command);
+   print "    \033[1;1m※ [$commands] ↘ \033[0m\n\n";
+   my $yy;
+   my $res = 1;
+   if($prompt == 1) {
+      printf "即将启动主进程数$color_bl$num\033[m个, 确定启动吗?(Y|y):";
+      chomp($yy = `line`);
+      if($interrupt){$interrupt=0;return 0;}
+   }else{
+      $yy = 'y';
+   }
+   if($yy =~ /^y$/i) {
+           my $child_pid = &create_child($_[0],$all_num,$function);
+           my $now_time = strftime "%Y%m%d_%H%M%S", localtime(time);
+           my $log_file = "$log_path/${$}_${now_time}.log";
+           if($num > 1){
+                   foreach my $x(1..$num) {
+                       ##system("$_ $x >> $log_file 2>&1 &" ) foreach(@$command);
+                       #$cmd = join(" $x >> $log_file 2>&1;",@$command);
+                       #system("$env; $cmd $x >> $log_file 2>&1 &");
+                       &the_fucking_cmd(" $x >> $log_file 2>&1",@$command);
+                   }
+           }else{
+                #system("$_ >> $log_file 2>&1 &") foreach (@$command);
+                #$cmd = join("  >> $log_file 2>&1;",@$command);
+                #system("$env; $cmd >> $log_file 2>&1 &");
+                &the_fucking_cmd(" >> $log_file 2>&1",@$command);
+                sleep $num;
+           }
+                   my $time_s = time();
+                   while(($pro_num = &all_proc($_[0])) < $num){
+                           if($interrupt){$interrupt=0;kill_child($child_pid);}
+                           if((my $diff_time = time() - $time_s) > $num){
+                                   kill_child($child_pid);
+                                   print "\n-> $color_bl启动时间持续${diff_time}s, 主进程没有达到$num个, 请检查!\033[m";
+                                   last;
+                           }
+                   }
+           $pro_num = &all_proc($_[0]);
+           print "\n-> $color_bl已启动进程数$pro_num个\033[m \n\n";
+           select(undef, undef, undef, 0.8);
+           kill_child($child_pid);
+           reaper() if $zombies;  # 收割僵死进程
+   }else{
+       print "-> $color_bl操作取消!\033[m\n\n";
+   }
+   return $res;
+}
+
+sub stop{
+   my ($num,$com_nn,$command,$new_command2) = &deal_attr($_[0]);
+   my $all_num = $num * $com_nn;
+   my $pro_num = my $init_num = &all_proc($_[0]);
+   if(! $pro_num){print "-> $color_bl主进程已经停止, 操作取消!\033[m \n\n";return 1;}
+   my @ps_attr = &proc_stop($_[0]);
+   my $ps_str = join(" $k_str]\n       [",@ps_attr);
+   $ps_str .= " $k_str";
+   print "    \033[1;1m※ [$ps_str] ↘ \033[0m\n\n";
+   my $yy;
+   my $res = 1;
+   if($prompt == 1) {
+      printf "当前进程数为$color_bl$pro_num\033[m个, 确定停止进程吗?(Y|y):";
+      chomp($yy = `line`);
+      if($interrupt){$interrupt=0;return 0;}
+   }else{
+      $yy = 'y';
+   }
+   if($yy =~ /^y$/i) {
+       my $child_pid = &create_child($_[0],$all_num,$function);
+       $_ =~ s/^p/ps -ef\|egrep -v  \"grep\|bash\|ps -e\"\|grep / foreach(@ps_attr);
+       $_ =~ s/$/ $k_str / foreach(@ps_attr);
+       my $now_time = strftime "%Y%m%d_%H%M%S", localtime(time);
+       my $log_file = "$log_path/${$}_${now_time}.log";
+       ###system("$_ >> $log_file 2>&1 &") foreach(@ps_attr);
+       &the_fucking_cmd(" >> $log_file 2>&1",@ps_attr);
+       my $time_s = time();
+           while(($pro_num = &all_proc($_[0]))){
+                   if(time() - $time_s > $stop_wait_time){
+                           kill_child($child_pid);
+                           my @ps_attr9;
+                           push @ps_attr9,$_." -9" foreach(@ps_attr);
+                           print "\n-> $color_bl已持续${stop_wait_time}s, 进程数仍为$pro_num个, 继续..\033[m \n";
+                           print "   ① [kill] \n   ② [kill -9] \n   ③ [取消操作!] \n   ④ [继续等待..] \n请选择:";
+                           my $chos;
+                           if ($opt_m) {
+                                 $chos = '3';
+                                 print "$chos\n";
+                           } else {
+                                 chomp($chos = `line`);
+                           }
+                           if($interrupt){$interrupt=0;print "\n";}
+                           if($chos eq '1') {
+                                 print "-> 执行[kill]\n";
+                                 $child_pid = &create_child($_[0],$all_num,$function);
+                                 &the_fucking_cmd(" >> $log_file 2>&1",@ps_attr);
+                           }elsif($chos eq '2') {
+                                 print "-> 执行[kill -9]\n";
+                                 $child_pid = &create_child($_[0],$all_num,$function);
+                                 &the_fucking_cmd(" >> $log_file 2>&1",@ps_attr9);
+                           }elsif($chos eq '3') {
+                                 print "-> 操作取消!\n";last;
+                           }else{
+                                 print "-> 发呆中...\n";
+                                 $child_pid = &create_child($_[0],$all_num,$function);
+                           }
+                           $time_s = time();
+                   }
+           }
+           select(undef, undef, undef, 0.8);
+           kill_child($child_pid);
+           print "\n-> $color_bl程序已停止!\033[m\n\n" if ! $pro_num;
+           reaper() if $zombies; 
+   }else{
+       print "-> $color_bl操作取消!\033[m\n\n";
+   }
+   return $res;
+}
+
+sub relax{
+   my ($num,$com_nn,$command,$new_command2) = &deal_attr($_[0]);
+   if(!$num){print "-> $color_bl进程无需启动!\033[m \n\n";return 1;}
+
+   my $all_num = $num * $com_nn;
+   my $pro_num = &all_proc($_[0],0,1);
+   my @ps_attr = &proc_stop($_[0]);
+   my $ps_str = join("]\n       [",@ps_attr);
+   my $flag = 1;
+   if($num !~ /\d+/){print "-> $color_bl进程数非法,请检查$proc_cfg配置\033[m\n\n";return 1;}
+   print "    \033[1;1m※ 停止: [$ps_str] \n    ※ 启动: 由controller拉起  \033[0m\n\n";
+   my $yy;
+   my $res = 1;
+   if($prompt == 1) {
+      printf "当前主进程数为$color_bl$pro_num\033[m个, 确定重启进程吗?(Y|y):";
+      chomp($yy = `line`);
+      if($interrupt){$interrupt=0;return 0;}
+   }else{
+      $yy = 'y';
+   }
+   if($yy =~ /^y$/i) {
+           my $child_pid = &create_child($_[0],$all_num,$function,1);
+           my $now_time = strftime "%Y%m%d_%H%M%S", localtime(time);
+           my $log_file = "$log_path/${$}_${now_time}.log";
+           my @pid_attrs = &all_proc_pid($_[0]);
+           label:foreach my $stop_pid(@pid_attrs){
+               system("$env;kill $stop_pid >> $log_file 2>&1 &") if $stop_pid;
+               my $time_s = time();
+               while(kill 0,$stop_pid){
+                   if((my $diff_time = time() - $time_s) >= $stop_wait_time){
+                           kill_child($child_pid);
+                           $flag = 0;
+                           print "\n-> $color_bl程序停止时间持续${diff_time}s, 进程数仍为1个, 继续..\033[m \n";
+                           print "   ① [kill $stop_pid] \n   ② [kill -9 $stop_pid] \n   ③ [取消操作!] \n   ④ [继续等待..] \n请选择:";
+                           my $chos;
+                           if ($opt_m) {
+                                 $chos = '3';
+                                 print "$chos\n";
+                           } else {
+                                 chomp($chos = `line`);
+                           }
+                           if($interrupt){$interrupt=0;print "\n";}
+                           if($chos eq '1') {
+                               print "-> 执行[kill $stop_pid]\n";
+                               $child_pid = &create_child($_[0],$all_num,$function,1);
+                               system("$env;kill $stop_pid >> $log_file 2>&1 &") ;
+                           }elsif($chos eq '2') {
+                               print "-> 执行[kill -9 $stop_pid]\n";
+                               $child_pid = &create_child($_[0],$all_num,$function,1);
+                               system("$env;kill -9 $stop_pid >> $log_file 2>&1 &") ;
+                           }elsif($chos eq '3') {
+                               print "-> 操作取消!\n";last;
+                           }else{
+                               print "-> 发呆中...\n";
+                               $child_pid = &create_child($_[0],$all_num,$function,1);
+                           }
+                           $time_s = time();
+                   }
+               }
+               if (!(kill 0,$stop_pid)){
+                   select(undef, undef, undef, 0.5);
+                   $time_s = time();
+                   while($all_num != &all_proc($_[0],0,1)){
+                           if($interrupt){$interrupt=0;kill_child($child_pid);}
+                           if((my $diff_time = time() - $time_s) >= $start_wait_time){
+                                   kill_child($child_pid);
+                                   print "\n-> $color_bl已持续${diff_time}s, 未成功启动, 取消重启操作, 请检查!\033[m\n\n";
+                                   last label;
+                           }
+                   }
+               }
+           }
+           select(undef, undef, undef, 0.5);
+           kill_child($child_pid);
+           reaper() if $zombies;
+           $pro_num = &all_proc($_[0],0,1);
+           print "\n-> $color_bl主进程数为$pro_num个!\033[m\n\n";
+   }else{
+       print "-> $color_bl操作取消!\033[m\n\n";
+   }
+   return $res;
+}
+
+
+sub restart{
+   my ($num,$com_nn,$command,$new_command2) = &deal_attr($_[0]);
+   if(!$num){print "-> $color_bl进程无需启动!\033[m \n\n";return 1;}
+
+   my $all_num = $num * $com_nn;
+   my $pro_num = &all_proc($_[0]);
+   my @ps_attr = &proc_stop($_[0]);
+   my $ps_str = join(" $k_str]\n       [",@ps_attr);
+   $ps_str .= " $k_str";
+   my $flag = 1;
+   if($num !~ /\d+/){print "-> $color_bl进程数非法,请检查$proc_cfg配置\033[m\n\n";return 1;}
+   my $commands = join("] \n       [",@$command);
+   print "    \033[1;1m※ 停止: \n       [$ps_str] \n    ※ 启动: \n       [$commands] ↘    \033[0m\n\n";
+   my $yy;
+   my $res = 1;
+   if($prompt == 1) {
+      printf "当前主进程数为$color_bl$pro_num\033[m个, 确定重启进程吗?(Y|y):";
+      chomp($yy = `line`);
+      if($interrupt){$interrupt=0;return 0;}
+   }else{
+      $yy = 'y';
+   }
+   if($yy =~ /^y$/i) {
+           my $child_pid = &create_child($_[0],$all_num,$function);
+           my $now_time = strftime "%Y%m%d_%H%M%S", localtime(time);
+           my $log_file = "$log_path/${$}_${now_time}.log";
+           if($num > 1){
+                   label:foreach my $x(1..$num){
+                       my $stop_pid = single_proc($_[0],$x);
+                       system("$env;kill $stop_pid >> $log_file 2>&1 &") if $stop_pid;
+                       my $time_s = time();
+                       while(($stop_pid = single_proc($_[0],$x))){
+                           if((my $diff_time = time() - $time_s) >= $stop_wait_time){
+                                   kill_child($child_pid);
+                                   $flag = 0;
+                                   print "\n-> $color_bl程序停止时间持续${diff_time}s, 进程数仍为1个, 继续..\033[m \n";
+                                   print "   ① [kill $stop_pid] \n   ② [kill -9 $stop_pid] \n   ③ [取消操作!] \n   ④ [继续等待..] \n请选择:";
+                                   my $chos;
+                                   if ($opt_m) {
+                                       $chos = '3';
+                                       print "$chos\n";
+                                   } else {
+                                       chomp($chos = `line`);
+                                   }
+                                   if($interrupt){$interrupt=0;print "\n";}
+                                   if($chos eq '1') {
+                                       print "-> 执行[kill $stop_pid]\n";
+                                       $child_pid = &create_child($_[0],$all_num,$function);
+                                       system("$env;kill $stop_pid >> $log_file 2>&1 &") ;
+                                   }elsif($chos eq '2') {
+                                       print "-> 执行[kill -9 $stop_pid]\n";
+                                       $child_pid = &create_child($_[0],$all_num,$function);
+                                       system("$env;kill -9 $stop_pid >> $log_file 2>&1 &") ;
+                                   }elsif($chos eq '3') {
+                                       print "-> 操作取消!\n";last;
+                                   }else{
+                                       print "-> 发呆中...\n";
+                                       $child_pid = &create_child($_[0],$all_num,$function);
+                                   }
+                                   $time_s = time();
+                           }
+                       }
+                       if (!($stop_pid = single_proc($_[0],$x))){
+                           select(undef, undef, undef, 0.5);
+                           ###system("$_ $x >> $log_file 2>&1 &") foreach(@$command);
+                           ##$cmd = join(" $x >> $log_file 2>&1;",@$command);
+                           ##system("$env; $cmd $x >> $log_file 2>&1 &");
+                           &the_fucking_cmd(" $x >> $log_file 2>&1",@$command);
+                           $time_s = time();
+                           while(!($stop_pid = single_proc($_[0],$x))){
+                                   if($interrupt){$interrupt=0;kill_child($child_pid);}
+                                   if((my $diff_time = time() - $time_s) >= $start_wait_time){
+                                           kill_child($child_pid);
+                                           print "\n-> $color_bl已持续${diff_time}s, 未成功启动, 取消重启操作, 请检查!\033[m\n\n";
+                                           last label;
+                                   }
+                           }
+                       }
+                   }
+           }else{
+               $_ =~ s/^p/ps -ef\|egrep -v  \"grep\|bash\|ps -e\"\|grep / foreach(@ps_attr);
+               $_ =~ s/$/ $k_str / foreach(@ps_attr);
+               ##system("$_ >> $log_file 2>&1 &") foreach(@ps_attr) ;
+               ##$cmd = join("  >> $log_file 2>&1;",@ps_attr);
+               ##system("$env; $cmd  >> $log_file 2>&1 &");
+               &the_fucking_cmd(" >> $log_file 2>&1",@ps_attr);
+               my $time_s = time();
+               while(($pro_num = &all_proc($_[0])) > 0){
+                       if((my $diff_time = time() - $time_s) >= $stop_wait_time){
+                          kill_child($child_pid);
+                          my @ps_attr9;
+                          push @ps_attr9,$_." -9" foreach(@ps_attr);
+                          $flag = 0;
+                          print "\n-> $color_bl程序停止时间持续${diff_time}s, 进程数仍为$pro_num个, 继续..\033[m \n";
+                          print "   ① [再来一次] \n   ② [暴力停止:-9哦] \n   ③ [取消操作!] \n   ④ [继续等待..] \n请选择:";
+                          my $chos;
+                          if ($opt_m) {
+                               $chos = '3';
+                               print "$chos\n";
+                          } else {
+                               chomp($chos = `line`);
+                          }
+                          if($interrupt){$interrupt=0;print "\n";}
+                          if($chos eq '1') {
+                              print "-> 执行[$ps_str]\n";
+                              $child_pid = &create_child($_[0],$all_num,$function);
+                              &the_fucking_cmd(" >> $log_file 2>&1",@ps_attr);
+                          }elsif($chos eq '2') {
+                              print "-> 执行[$ps_str -9]\n";
+                              $child_pid = &create_child($_[0],$all_num,$function);
+                              &the_fucking_cmd(" >> $log_file 2>&1",@ps_attr9);
+                          }elsif($chos eq '3') {
+                              print "-> 操作取消!\n";last;
+                          }else{
+                              print "-> 发呆中...\n";
+                              $child_pid = &create_child($_[0],$all_num,$function);
+                          }
+                          $time_s = time();
+                       }
+               }
+               if(! ($pro_num = &all_proc($_[0]))){
+                       select(undef, undef, undef, 0.5);
+                       ###system("$_ >> $log_file 2>&1 &") foreach(@$command);
+                       ##$cmd = join("  >> $log_file 2>&1;",@$command);
+                       ##system("$env; $cmd >> $log_file 2>&1 &");
+                       &the_fucking_cmd(" >> $log_file 2>&1",@$command);
+                       my $time_s = time();
+                       while(($pro_num = &all_proc($_[0])) == 0){
+                           if($interrupt){$interrupt=0;kill_child($child_pid);}
+                           if((my $diff_time = time() - $time_s) >= $start_wait_time){
+                                   kill_child($child_pid);
+                                   print "\n-> $color_bl启动时间持续${diff_time}s, 主进程没有达到$num个, 跳过等待, 请手工检查!\033[m\n";
+                                   last;
+                           }
+                       }
+                   ###print "-> 已重启程序, 主进程数为$pro_num个!\n\n" if $pro_num;
+               }
+           }
+           select(undef, undef, undef, 0.5);
+           kill_child($child_pid);
+           reaper() if $zombies;
+           $pro_num = &all_proc($_[0]);
+           print "\n-> $color_bl主进程数为$pro_num个!\033[m\n\n";
+   }else{
+       print "-> $color_bl操作取消!\033[m\n\n";
+   }
+   return $res;
+}
+
+sub cyc_call{
+   my $res = 2;
+   my ($key,$choose,$mode) = @_;
+   my @value = @{$window{$key}{"$choose"}};
+   if($key eq 'main' && $choose ne $mode_hash{$h_mode}){
+       print "-> $color_bl不属于$h_mode主机应用! \033[m\n\n";
+   }elsif($choose && $window{$key}{"$choose"} && (! $value[2] || $host_state eq $value[2])){ #存在
+       my $values;
+       if($value[1] =~ /^sub/){ #进入子菜单
+          if($window{$value[1]}){
+                if($mode == 1){
+                    ##my $boot_function = @{$window{$value[1]}{'00'}}->[2];
+                    if(defined &{$boot_function}){ #引导函数
+                            my $rtn = &{$boot_function}($value[1]);
+                            if($rtn == -1){$choose = 0;next};
+                    }elsif($boot_function){
+                            warn "   WARN:引导函数[$boot_function]未定义,无法执行.\n\n";
+                    }
+                    display_menu($value[1]); #下一个子菜单
+                }else{
+                    foreach my $child_key (sort keys %{$window{$value[1]}}) {
+                           next if $child_key eq '00';
+                           last if ! ($res = cyc_call($value[1],$child_key,0));
+                    }
+                }
+          }else{
+                print "你选择的子菜单:$value[1]未定义,请检查start_menu.cfg配置\n\n";
+          }
+       }elsif($value[1] =~ /^command/){
+          $values .= "$key.$choose"; 
+          $script_str = $value[0];
+          $count++;
+          &get_str($key);
+          print "[$count] $script_str \n";
+          if( ! $process{$values}) {
+               print "你选择程序脚本未定义,请检查$proc_cfg配置$values\n\n";
+          }elsif($values =~ /^sub$mode_hash{$h_mode}/){
+               my $enable_user = $value[3] ? $value[3] : 'ngboss';
+               if($user eq $enable_user){
+                    if($value[1] eq 'command_rebt'){
+                         if($function eq 'restart'){
+                             eval{$res = &relax($values)};
+                             if($@){ $interrupt = 0; warn "→ 执行出错:$@\n" };
+                         }else{
+                             print "-> ${color_bl}worker只能动态重启, 不支持$function模式!\033[m \n\n";
+                         }
+                    }else{
+                         eval{$res = &{$function}($values)};
+                         if($@){ $interrupt = 0; warn "→ 执行出错:$@\n" };
+                    }
+               }else{
+                    print "-> $color_bl$user用户无权限操作, 请切换程序账号$enable_user!\033[m \n\n";
+               }
+          }else{
+               print "-> $color_bl不属于$h_mode主机应用!\033[m\n\n";
+          }
+       }else{ #执行定义的函数
+         warn "   WARN:函数[$value[1]]未定义,无法执行.\n\n";
+       }
+   }else{
+       print "你选择的子菜单[$key.$choose]无效.\n\n";
+   }
+   #print "$key|$choose|$res\n";
+   return $res;
+}
+
+#窗口管理
+sub display_menu {
+   my ($key,$choose) = @_;
+   my ($title,$last) = @{$window{$key}{'00'}};
+   #计算窗口行长和列数
+   #if(! $choose){
+        my ($cols,$line);
+        my $need_len = $key_length{$key}{0} + $key_length{$key}{1} + 10;
+        if($need_len < $tty_cols){
+                $cols = 2;
+                $line = $need_len;
+        }else{
+                $cols = 1;
+                $line = (($key_length{$key}{0} > $key_length{$key}{1}) ? $key_length{$key}{0} : $key_length{$key}{1}) + 5;
+        }
+    #if($key eq 'main'){
+    if(! $first){
+        print "本主机未定义应用启动!\n" and exit if ! $hosts{$host_flag};
+        while(1){
+              $xxoo = $opt_c if $opt_c =~ /^$flags$/i;
+              $xxoo = $flags if $host_flag !~ /^$mult_node$/;
+              if(!$xxoo){
+                    print "本主机承载多节点业务,请选择[\U$flags\E]:";
+                    chomp($xxoo = `line`);
+                    if($interrupt){print "Catch signal\n";exit 2};
+              }
+              $xxoo =~ s/^\s+|\s+$//g;
+        
+              if($xxoo && $xxoo =~ /^$flags$/i){ #存在
+                    $first ++ if $opt_m;
+                    $xxoo =~ /^(\w\w)(\d*)/;
+                    $city = "\L$1";
+                    $City = "\U$1";
+                    $city_num = "\L$1$2";
+                    $node = "[$swic_flag{$city} \U$xxoo\E]";
+                    $cn   = "\L$xxoo";
+                    $node0= $hosts{$host_flag}{$cn};
+                    do "start.cfg";
+                    do "$proc_cfg";
+                    $env = "$env_tmp ; cd $core_dir ";
+                    last;
+              }
+              $xxoo = 0;
+        }
+    }
+
+    #导航栏提示
+    my $nav_bar;
+    my $nav_bar2 = "$node 当前模式: $functions{$function} $function";
+    if($key ne 'main'){
+      my @sub_key = split('_',$key);
+      my $str = @sub_key[0];
+      my $str_num = substr($str,3,);
+      $nav_bar = "位置:main→ $str_num)$window{$str}{'00'}->[0]";
+      for(@sub_key[1..$#sub_key]){
+          $str .= "_${_}";
+          $nav_bar .= "→ ${_})$window{$str}{'00'}->[0]";
+      }
+    }else{
+      chomp(my $dat = `date`);
+      $nav_bar = "$title  $dat";
+    } 
+    print "\n   $nav_bar\n\033[1m   $nav_bar2\033[m\n";
+
+    $length = (length($nav_bar) > length($nav_bar2) ? (length($nav_bar) > $line ? length($nav_bar) : $line) : (length($nav_bar2) > $line ? length($nav_bar2) : $line));
+    print "   +",'-' x $length,"+";
+    
+    #打印菜单列表
+    my ($mm,$mod,$space_lg,$first_line);
+    @ps_args0 = `ps -ef|egrep -v  "grep|bash|ps -e"`;
+    for(sort keys %{$window{$key}}){
+      if($_ > 0){
+          next if $window{$key}{$_}->[2] && $host_state ne $window{$key}{$_}->[2];
+          my $item_name = ($window{$key}{$_}->[1] =~/^sub/ ? "$window{$key}{$_}->[0]↘" : "$window{$key}{$_}->[0]");
+          $exist_flag = 0;
+          &is_exist($key,$_) if $key =~ /^sub$mode_hash{$h_mode}/ || $key.$_ eq "main".$mode_hash{$h_mode};
+          my $color_b = $exist_flag == 1 ? "\033[m" : ($exist_flag == 2 ? "\033[35;5m" : ($exist_flag == 3 ? "\033[35;1;5m" : "\033[4m"));
+          my $color_e = "\033[m";
+          if($cols==2){
+            $mod = ++$mm % 2;
+            #$space_lg = $key_length{$key}{$mod} - length($item_name);
+            if($mod){ #第一列
+                   $space_lg = $key_length{$key}{$mod} - length($item_name);
+                   $first_line = $key_length{$key}{$mod};
+                   printf("\n   | ${color_b}%02d) %s${color_e}%${space_lg}s",$_,$item_name,"");
+            }else{    #第二列
+                   $space_lg = $length - $first_line - length($item_name) - 10;
+                   printf(" ${color_b}%02d) %s${color_e}%${space_lg}s|",$_,$item_name,"");
+            }
+          }else{
+                $space_lg = $length - length($item_name) - 5;            
+                printf("\n   | ${color_b}%02d) %s${color_e}%${space_lg}s|",$_,$item_name,"");
+          }
+      }
+    }
+    $space_lg = $length - $first_line - 5;
+    printf "%${space_lg}s|","" if $mod; 
+    #状态栏操作信息
+    print "\n   +",'-' x $length,"+\n";
+    if($last eq 'null'){
+          print "    M|m)菜单 X|x)退出 H|h)帮助\033[m\n\n";      
+    }else{
+          print "    M|m)菜单 B|b)后退 X|x)退出 H|h)帮助\033[m\n\n";
+    }
+  #}
+  
+  
+  while(1){
+        if(!$choose){
+                print "$h_mode $node:" if $first;
+                if($key eq 'main' && ! $first){
+                    $choose = $mode_hash{$h_mode};
+                    $first ++;
+                }else{
+                    chomp($choose = `line`);
+                }
+                if($interrupt){print "Catch signal\n";exit 2};
+        }
+        $choose =~ s/^\s+|\s+$//g;
+        $choose =~ s/^(\d)$/0$1/;
+    if($choose>0 && $window{$key}{"$choose"}){ #存在
+      print "\033[1;4m▲ 运行模式为: $functions{$function} $function\033[0m\n\n" if @{$window{$key}{"$choose"}}->[1] !~ /^sub/;
+         $count = 0;
+        &cyc_call($key,$choose,1);
+        if ($opt_m) {
+                last;
+        } else { 
+                display_menu($key);
+        }
+    }elsif($choose =~ /^b$/i){
+        if($last ne 'null'){ display_menu($last) }else{ exit 0};
+    }elsif($choose =~ /^x$/i){
+        exit 1;
+    }elsif($choose =~ /^prompt$/i){
+        $prompt *= -1;
+        if($prompt == 1){print "交互模式 开启.\n\n";}
+        else{print "交互模式 关闭.\n\n";}
+    }elsif($choose =~ /,/ || $choose =~ /^(start|stop|restart)/){
+        $function = $1 if $choose =~ /^(start|stop|restart)/;
+        $choose =~ s/^(start|stop|restart)//;
+        print "\033[1;4m▲ 运行模式为: $functions{$function} $function\033[0m\n\n";
+        my @chooses = split(',',$choose);
+          $count = 0;
+        foreach my $ach(@chooses) {
+                  $ach =~ s/^\s+|\s+$//g;
+            $ach =~ s/^(\d)$/0$1/;
+            my $res = &cyc_call($key,$ach,0);
+            last if ! $res;
+        }
+        if ($opt_m) {
+                last;
+        } else {
+                display_menu($key);
+        }
+    }elsif($choose =~ /^h$/i){
+        print<<guide;
+\n   ☆ 帮助说明
+   ① prompt                  : 选择打开或者关闭操作互交。
+   ② start|stop|restart      : 切换程序启动、停止、重启操作。
+   ③ xx,xx,xx                : 批量操作，以逗号[,]分隔。执行所选菜单下所有内容，包括子菜单
+   ④ start|stop|restart + xx : 快速切换，并执行。
+   ⑤ 启停屏幕打印信息        : 存放目录/logs/_start_logs/
+   ⑥ 菜单字体状态说明        : \033[4m下划线\033[m表示无需操作程序，\033[35;5m闪烁\033[m表示应用未启动或未达到所设置的主进程个数(\033[35;1;5m闪烁且加粗\033[m表示菜单组下所有程序均未符合)\n
+guide
+    }elsif($choose =~ /^m$/i){
+        display_menu($key);
+    }
+    $choose = 0;
+    reaper() if $zombies;
+  }
+}
+
+main:{
+    $hostname =~ /^\D+_(\w\w)\D+(\d+)$/;
+    $host_flag = $1.$2;
+    $flags = join('|',(keys %{$hosts{$host_flag}}));;
+    die "Usage: \n【Normal】$0\n          $0  -c [$flags]\n【Faster】$0  -c [$flags]  -m [start|stop|restart]\n" if $opt_h || ( $opt_m && ($opt_m !~ /^(start|stop|restart|rest_credit|rest_other)$/i || $opt_c !~ /^$flags$/i) );
+    eval{ mkpath($log_path,0,0755) } if ! -e $log_path;  # 创建日志目录
+    die "Make LogPath [$log_path] failed.\n$@" if $@;
+    do "start.cfg";
+    &item_length;
+    if ($opt_m) {
+        do "start_fast.cfg";
+        $prompt = -1;
+        $xxoo = $opt_c; 
+        foreach (@{$process_menu{$opt_m}}) {
+                $opt_m = 'restart' if $opt_m =~ /^(rest_credit|rest_other)$/i;
+                display_menu($$_[0],"$opt_m $$_[1]");
+        }
+    } else { 
+        display_menu('main');
+    }
+}
